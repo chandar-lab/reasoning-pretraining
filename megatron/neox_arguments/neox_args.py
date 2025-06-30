@@ -983,9 +983,10 @@ class NeoXArgsTokenizer(NeoXArgsTemplate):
         "SPMTokenizer",
         "CharLevelTokenizer",
         "TiktokenTokenizer",
+        "Llama3HFTokenizer"
     ] = "GPT2BPETokenizer"
     """
-    Type of tokenizer to use - should be one of ["GPT2BPETokenizer", "HFTokenizer", "HFGPT2Tokenizer", "SPMTokenizer", "CharLevelTokenizer", "TiktokenTokenizer"]
+    Type of tokenizer to use - should be one of ["GPT2BPETokenizer", "HFTokenizer", "HFGPT2Tokenizer", "SPMTokenizer", "CharLevelTokenizer", "TiktokenTokenizer","Llama3HFTokenizer]
     """
 
     padded_vocab_size: int = None
@@ -1159,10 +1160,29 @@ class NeoXArgsTraining(NeoXArgsTemplate):
     Dataset implementation, can be one of "gpt2", "pairwise", or "online"
     """
 
-    train_impl: Literal["normal", "dpo", "rm", "kto", "reinforce"] = "normal"
+    train_impl: Literal["normal", "dpo", "rm", "kto", "reinforce","latent_rl"] = "normal"
     """
     Training implementation, can be one of "normal", "dpo", "kto", "reinforce", or "rm"
     """
+
+
+
+    latent_rl_weight: float = 1.0
+    """
+    Weight for latent RL loss in training. Only used if train_impl is "latent_rl".
+    """
+    latent_thinking_steps: int = 1
+    """
+    Number of latent thinking steps to perform in latent RL training.
+    Only used if train_impl is "latent_rl".
+    """
+
+    latent_dim : int = 512
+
+
+    latent_reasoning_probability: float = 0.5
+
+
 
     dpo_fp32: bool = True
     """

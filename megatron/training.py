@@ -32,6 +32,9 @@ import torch.nn.functional as F
 import deepspeed
 from deepspeed.runtime.data_pipeline.curriculum_scheduler import CurriculumScheduler
 import numpy as np
+# from random import random
+import random
+
 
 from megatron.utils import (
     Timers,
@@ -549,7 +552,7 @@ def forward_step(
     if timers is not None:
         timers("batch generator").start()
     if neox_args.train_impl == "normal":
-        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
+        tokens, labels, loss_mask, attention_mask, position_ids  = get_batch(
             neox_args=neox_args, data_iterator=data_iterator
         )
     elif neox_args.train_impl == "kto":
@@ -586,6 +589,7 @@ def forward_step(
         torch.cuda.nvtx.range_push(f"Forward pass")
     metrics = {}
     if neox_args.train_impl == "normal":
+        # tokens, labels, loss_mask, attention_mask, position_ids = batch
         outputs = model((tokens, position_ids, attention_mask), neox_args=neox_args)
         if (
             is_train
@@ -861,7 +865,7 @@ def forward_step(
         torch.cuda.nvtx.range_pop()
     if return_logits:
         return loss, outputs, metrics
-    return loss, metrics
+    return loss, metrics,tokens
 
 
 def get_model(neox_args, use_cache=False):
@@ -1281,36 +1285,22 @@ def backward_step(neox_args, timers, optimizer, model, loss):
         raise ValueError("Must be using deepspeed to run neox")
 
 
-def train_step(
-    neox_args,
-    timers,
-    data_iterator,
-    model,
-    optimizer,
-    lr_scheduler,
-    reference_model=None,
-):
-    """Single training step."""
+def train_step(neox_args, timers, data_iterator, model, optimizer, lr_scheduler, reference_model=None):
+    """Single training step with RL Latent Reasoning."""
     # Pipeline parallelism schedules forward/backward/step
     if neox_args.is_pipe_parallel:
         reduced_loss = train_step_pipe(
             neox_args=neox_args, timers=timers, model=model, data_iterator=data_iterator
         )
         reduce_metrics = reduced_loss
-        if (
-            neox_args.memory_profiling
-            and neox_args.iteration >= neox_args.profile_step_start
-            and neox_args.iteration <= neox_args.profile_step_stop
-            and torch.distributed.get_rank() == 0
-        ):
-            save_snapshot(neox_args)
     else:
         losses = []
         metric_dicts = defaultdict(list)
+        
         for _ in range(neox_args.gradient_accumulation_steps):
-            # Forward model for one step.
+            # Forward pass for one step.
             timers("forward").start()
-            loss, metric_dict = forward_step(
+            loss, metric_dict,tokens = forward_step(
                 neox_args=neox_args,
                 timers=timers,
                 data_iterator=data_iterator,
@@ -1322,68 +1312,58 @@ def train_step(
             losses.append(loss)
             for key in metric_dict.keys():
                 metric_dicts[key].append(metric_dict[key])
-            # Calculate gradients, reduce across processes, and clip.
-            if (
-                neox_args.profile
-                and neox_args.iteration >= neox_args.profile_step_start
-                and neox_args.iteration <= neox_args.profile_step_stop
-            ):
-                torch.cuda.nvtx.range_push(f"Backward pass")
-            timers("backward").start()
-            backward_step(
-                neox_args=neox_args,
-                timers=timers,
-                optimizer=optimizer,
-                model=model,
-                loss=loss,
-            )
-            timers("backward").stop()
-            if (
-                neox_args.profile
-                and neox_args.iteration >= neox_args.profile_step_start
-                and neox_args.iteration <= neox_args.profile_step_stop
-            ):
-                torch.cuda.nvtx.range_pop()
-            # Update parameters.
-            if (
-                neox_args.profile
-                and neox_args.iteration >= neox_args.profile_step_start
-                and neox_args.iteration <= neox_args.profile_step_stop
-            ):
-                torch.cuda.nvtx.range_push(f"Optimizer step")
+            
+            # Latent Reasoning Phase (RL)
+            if random.random() < neox_args.latent_reasoning_probability:
+                t = random.randint(1, tokens.size(1) - 1)
+                print_rank_0(f"Using latent reasoning with t={t}")
+                prefix = tokens[:, :t]
+                print_rank_0(f"Prefix length: {prefix.size(1)}")
+                suffix = tokens[:, t:]
+                print_rank_0(f"Suffix length: {suffix.size(1)}")
 
+                # Perform latent reasoning through Gaussians
+                latent_gaussians = sample_latent_gaussians(prefix,model)
+
+                
+                # Predict tokens using the latent reasoning
+                predicted_tokens = decode_with_latents(prefix, latent_gaussians,model,neox_args)
+                print_rank_0(f"Predicted tokens shape: {predicted_tokens.size()}")
+                exit()
+                
+                # Compute reward and RL loss
+                reward = calculate_reward(predicted_tokens, suffix)
+                rl_loss = compute_rl_loss(reward, latent_gaussians)
+
+                # Add RL loss to the standard loss
+                total_loss = loss + rl_loss
+            else:
+                total_loss = loss
+
+            # Backward pass for the computed loss
+            timers("backward").start()
+            backward_step(neox_args=neox_args, timers=timers, optimizer=optimizer, model=model, loss=total_loss)
+            timers("backward").stop()
+
+            # Update parameters
             timers("optimizer").start()
             if neox_args.deepspeed:
                 model.step()
             else:
                 raise ValueError("Must be using deepspeed to run neox")
             timers("optimizer").stop()
-            if (
-                neox_args.profile
-                and neox_args.iteration >= neox_args.profile_step_start
-                and neox_args.iteration <= neox_args.profile_step_stop
-            ):
-                torch.cuda.nvtx.range_pop()
-            if (
-                neox_args.profile
-                and neox_args.iteration >= neox_args.profile_step_start
-                and neox_args.iteration <= neox_args.profile_step_stop
-                and torch.distributed.get_rank() == 0
-            ):
-                save_snapshot(neox_args)
-        # reduces metrics across machines for logging
+
+        # Reducing metrics and logging
         reduce_metrics = {
             key: reduce_losses(metric_dicts[key]).mean() for key in metric_dicts.keys()
         }
         reduce_metrics["lm_loss"] = reduce_losses(losses).mean()
-
     if neox_args.precision == "fp16" and model.optimizer.overflow:
         skipped_iter = 1
     else:
         skipped_iter = 0
-
-    collect_loss_for_unit_test(reduce_metrics["lm_loss"])
     return reduce_metrics, skipped_iter
+
 
 
 def train_step_pipe(neox_args, timers, model, data_iterator):
@@ -1727,3 +1707,106 @@ def save_snapshot(neox_args):
         os.makedirs(snapshot_path)
     with open(os.path.join(snapshot_path, "mem_snapshot.pickle"), "wb") as f:
         dump(snapshot, f)
+
+
+
+
+def sample_from_logits(logits, top_k=50):
+    """Sample a token from the logits using top-k sampling."""
+    probs = F.softmax(logits, dim=-1)  # Convert logits to probabilities
+    top_k_probs, top_k_indices = torch.topk(probs, top_k, dim=-1)
+    
+    # Sample from the top-k probabilities
+    selected_token = torch.multinomial(top_k_probs, 1)  # Sample from the top-k
+    return top_k_indices.gather(-1, selected_token)
+
+def compute_rl_loss(reward, latent_gaussians):
+    """Compute the RL loss using REINFORCE-style policy gradient."""
+    # Compute log probabilities of the latent actions (from model)
+    log_probs = model.latent_log_probs(latent_gaussians)
+
+    # Using REINFORCE policy gradient loss: -log_prob(z) * reward
+    rl_loss = -(log_probs * reward).mean()  # Mean over batch
+    return rl_loss
+
+
+def calculate_reward(predicted_tokens, suffix):
+    """Calculate the reward based on the predicted token accuracy."""
+    correct_tokens = (predicted_tokens == suffix[:, 0])  # Check if the first token matches
+    reward = correct_tokens.float()  # Convert boolean to float for reward
+    return reward
+
+def decode_with_latents(prefix, latent_gaussians, model, neox_args):
+    """
+    Decodes the prefix with the sampled latent vectors by combining them and passing them through the model.
+
+    :param prefix: Tensor of shape [batch_size, prefix_length], the input prefix tokens
+    :param latent_gaussians: Tensor of shape [batch_size, d, latent_dim], the sampled latent vectors
+    :param model: The model to be used for decoding the combined input
+    :param neox_args: Arguments passed to the model
+    :return: Logits or predictions from the model
+    """
+    # Ensure the latent_gaussians tensor is properly shaped (batch_size, d, latent_dim)
+    batch_size, d, latent_dim = latent_gaussians.size()
+
+    # Flatten the latent_gaussians tensor to be concatenated with the prefix
+    # We need to flatten latent_gaussians to [batch_size, d * latent_dim]
+    flattened_latents = latent_gaussians.view(batch_size, -1)  # Flattening to [batch_size, d * latent_dim]
+
+    # Ensure both tensors (prefix and flattened_latents) have the same batch size
+    if prefix.size(0) != flattened_latents.size(0):
+        raise ValueError(f"Batch size mismatch: prefix batch size {prefix.size(0)} vs. latent_gaussians batch size {flattened_latents.size(0)}")
+
+    # Ensure the prefix and flattened_latents tensors are on the same device
+    prefix = prefix.to(latent_gaussians.device)
+
+    # Concatenate the prefix and flattened latents along the sequence dimension
+    combined_input = torch.cat([prefix, flattened_latents], dim=1)  # Shape: [batch_size, prefix_length + d * latent_dim]
+    combined_input = combined_input[:, :neox_args.seq_length]  # Ensure it matches the model's expected input length
+    print_rank_0(f"Combined input shape: {combined_input.size()}")
+
+    # Forward pass through the model
+    logits = model(combined_input)  # The model will output the logits for prediction
+    print_rank_0(f"Logits shape: {logits.size()}")
+
+    return logits
+
+
+
+
+def sample_from_logits(logits):
+    """
+    Function to sample a token from logits, typically using a softmax or top-k sampling approach.
+    """
+    probs = torch.softmax(logits, dim=-1)  # Apply softmax to get probabilities
+    return torch.multinomial(probs, 1)  # Sample a token from the probabilities
+
+
+
+
+
+def sample_latent_gaussians(prefix, model, d=6):
+    """Sample Gaussian latents autoregressively starting from the prefix."""
+    # print_rank_0(model._modules)
+    for idx, layer in enumerate(model.sequential):
+        print(f"Layer {idx}: {layer}")
+    
+    # Get the batch size from the prefix
+    batch_size = prefix.size(0)
+
+    # Get the latent space layer (this might need to be updated based on your model's architecture)
+    latent_space_layer = model.sequential[10].func ############# THIS SHOULD BE CHANGED BASED ON THE ARCHITECTURE ##############
+    
+    latent_state = latent_space_layer.init_latent_state(prefix)  # Initialize the latent state
+    latents = []
+    
+    # Sample latents for the given batch size
+    for _ in range(d):
+        z = latent_space_layer.sample_latent(batch_size=batch_size, device=prefix.device)  # Sample latent representation
+        latents.append(z)
+        latent_state = z
+    
+    # Stack the sampled latents to match the required shape [batch_size, d, latent_dim]
+    latents = torch.stack(latents, dim=1)  # Shape: [batch_size, d, latent_dim]
+    
+    return latents

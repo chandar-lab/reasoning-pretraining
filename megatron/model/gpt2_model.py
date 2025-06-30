@@ -92,19 +92,44 @@ def _post_transformer_block(args):
     fn = lambda _args: (_args[0].transpose(0, 1).contiguous())
     return fn(args)
 
+class LatentSpaceLayer(nn.Module):
+    def __init__(self, latent_dim):
+        super(LatentSpaceLayer, self).__init__()
+        self.latent_dim = latent_dim
+        self.latent_projection = nn.Linear(latent_dim, latent_dim)  # Projection to latent space
+
+    def forward(self, x):
+        return self.latent_projection(x)
+    def init_latent_state(self, prefix=None):
+        """Initialize latent vectors for reasoning."""
+        # For illustration, return zero vectors of the latent_dim
+        return torch.zeros((1, self.latent_dim)).to(prefix.device)
+
+    def sample_latent(self, batch_size, device):
+        """
+        Sample latent vectors from a Gaussian distribution.
+        
+        :param batch_size: The number of samples to generate.
+        :param device: The device to generate the latent vectors on.
+        :return: Sampled latent vectors.
+        """
+        return torch.randn(batch_size, self.latent_dim).to(device)
+
+
+    def decode_with_latents(self, combined_input):
+        """
+        Decode the latent representation back to logits.
+
+        :param prefix: The prefix of tokens or initial inputs.
+        :param latent_gaussians: The latent space representations.
+        :return: logits for token prediction
+        """
+        # You can concatenate the prefix with the latent representations if needed
+        logits = self.decoder(combined_input)  # Use a linear layer to generate logits from the latent vector
+        return logits
 
 class GPT2ModelPipe(PipelineModule, torch.nn.Module):
-    """GPT2Model adapted for pipeline parallelism.
-
-    The largest change is flattening the GPTModel class so we can express it as a
-    sequence of layers including embedding, transformer layers, and output.
-
-    :param neox_args: NeoX arguments object (configuration)
-    :param num_tokentypes: number of token types (TODO: deprecated, remove)
-    :param parallel_output: if true, don't gather the output logits, and calculate loss in parallel. Set to true by default in training for efficiency, but set to false for inference.
-    :param topology: deepspeed topology object specifying pipe / model parallelism topology.
-    :param use_cache: if true, cache key/value pairs for each layer in inference.
-    """
+    """GPT2Model adapted for pipeline parallelism."""
 
     def __init__(
         self,
@@ -120,14 +145,14 @@ class GPT2ModelPipe(PipelineModule, torch.nn.Module):
         self.parallel_output = parallel_output
         self.hidden_size = self.neox_args.hidden_size
         self.num_tokentypes = num_tokentypes
-        self.init_method, self.output_layer_init_method = get_init_methods(
-            self.neox_args
-        )
+        self.init_method, self.output_layer_init_method = get_init_methods(self.neox_args)
         self.__topology__ = topology
 
+        # Initialize specs first
         self.specs = []
-        self.init_specs()  # initializes the layer specs (basically a fancy nn.Sequential)
+        self.init_specs()  # Initialize the layer specs (basically a fancy nn.Sequential)
 
+        # Initialize the parent class after specs are initialized
         super().__init__(
             layers=self.specs,
             loss_fn=partial(cross_entropy, _fp16=self.neox_args.fp16_lm_cross_entropy),
@@ -142,6 +167,13 @@ class GPT2ModelPipe(PipelineModule, torch.nn.Module):
                 "ParallelMambaResidualLayerPipe",
             ],
         )
+
+        # Now initialize latent space layer after parent class initialization
+        self.latent_dim = neox_args.latent_dim  # Add latent dimension to the config
+        self.latent_space_layer = LatentSpaceLayer(self.latent_dim)  # Initialize the latent space layer
+
+        # Insert the latent space layer into the model specs at index 1 (after embedding)
+        self.specs.insert(-1, self.latent_space_layer)
 
     def insert_layers(
         self, layers: Union[nn.Module, nn.ModuleList, nn.Sequential, List], idx
@@ -180,14 +212,26 @@ class GPT2ModelPipe(PipelineModule, torch.nn.Module):
             ],
         )
 
-    def init_specs(self):
 
+    def decode_with_latents(self, prefix, latent_gaussians):
+        """
+        Decode predicted tokens using latent representations (Gaussians).
+
+        :param prefix: The prefix input tensor (could be token embeddings or hidden states).
+        :param latent_gaussians: The latent vectors sampled or generated for decoding.
+        :return: Decoded logits (predicted token probabilities/logits).
+        """
+        x = latent_gaussians
+        for layer in self.specs:
+            x = layer(x)  
+        logits = x 
+        return logits
+
+    def init_specs(self):
         weight_tying = not self.neox_args.no_weight_tying
         self.specs = []
 
         # Embedding layer
-        # input will be (input_ids, position_ids, attention_mask)
-
         if weight_tying:
             self.specs.append(
                 TiedLayerSpec(
@@ -217,27 +261,7 @@ class GPT2ModelPipe(PipelineModule, torch.nn.Module):
                 )
             )
 
-        # NB: the attention mask always needs to be the *last* item in the args when being passed from
-        # one stage to the next, because deepspeed is hacks on top of hacks.
-        #
-        # outputs are now (hidden_states,  attention_mask)
-
         self.specs.append(_pre_transformer_block)
-
-        # T5 RPE positional embedding
-        if self.neox_args.pos_emb == "rpe":
-            hidden_size_per_attention_head = mpu.divide(
-                self.neox_args.hidden_size, self.neox_args.num_attention_heads
-            )
-            rpe_scale = math.sqrt(hidden_size_per_attention_head)
-            rpe_emb = ParallelRelativePositionBias(
-                neox_args=self.neox_args,
-                scale=rpe_scale,
-                causal=True,
-                num_buckets=self.neox_args.rpe_num_buckets,
-                max_distance=self.neox_args.rpe_max_distance,
-                heads=self.neox_args.num_attention_heads,
-            )
 
         # Transformer layers
         for i in range(self.neox_args.num_layers):
@@ -253,24 +277,6 @@ class GPT2ModelPipe(PipelineModule, torch.nn.Module):
                         mask_fn=gpt2_attention_mask_func,
                     )
                 )
-            elif layer_type == "rwkv":
-                self.specs.append(
-                    LayerSpec(
-                        RWKVResidualLayerPipe,
-                        neox_args=self.neox_args,
-                        layer_number=i,
-                    )
-                )
-            elif layer_type in ["mamba"]:
-                self.specs.append(
-                    LayerSpec(
-                        ParallelMambaResidualLayerPipe,
-                        neox_args=self.neox_args,
-                        init_method=self.init_method,
-                        output_layer_init_method=self.output_layer_init_method,
-                        layer_number=i,
-                    )
-                )
             else:
                 self.specs.append(
                     LayerSpec(
@@ -280,67 +286,27 @@ class GPT2ModelPipe(PipelineModule, torch.nn.Module):
                         init_method=self.init_method,
                         output_layer_init_method=self.output_layer_init_method,
                         layer_number=i,
-                        rpe=rpe_emb if self.neox_args.pos_emb == "rpe" else None,
-                        rotary=self.neox_args.pos_emb == "rotary",
-                        use_cache=self.use_cache,
                     )
                 )
 
-        # used to drop attention mask + reshape hidden states
         self.specs.append(_post_transformer_block)
 
-        # NormPipe is a (deprecated) helper class that used to be used to pass presents along the pipeline - since presents are now cached to the `TransformerLayer` class this is no longer needed
+        # NormPipe
         norm, eps = get_norm(self.neox_args)
         self.specs.append(
             LayerSpec(NormPipe, norm, self.neox_args.hidden_size, eps=eps)
         )
 
-        # outputs are now a single tensor: hidden_states
-
-        def _logits_helper(embedding, lm_output):
-            """Just a wrapper to massage inputs/outputs from pipeline."""
-            if self.neox_args.use_mup:
-                # Since we're using pipeline parallelism, we can't directly use MuReadout. Instead, use this workaround that does the same thing as MuReadout.
-                # https://github.com/microsoft/mup/issues/6#issuecomment-1082156274
-                lm_output = (
-                    lm_output
-                    / self.tied_modules.embed.word_embeddings.weight.infshape.width_mult()
-                )
-
-            logits = parallel_lm_logits(
-                lm_output,
-                embedding.word_embeddings_weight,
-                self.parallel_output,
-                seq_parallel=self.neox_args.sequence_parallel,
+        # Logits layer
+        self.specs.append(
+            LayerSpec(
+                ParallelLinearPipe,
+                neox_args=self.neox_args,
+                init_method=self.init_method,
+                parallel_output=self.parallel_output,
+                is_last_layer=True,
             )
-            return logits
-
-        if weight_tying:
-            self.specs.append(
-                TiedLayerSpec(
-                    "embed",
-                    EmbeddingPipe,
-                    self.neox_args,
-                    self.hidden_size,
-                    self.neox_args.padded_vocab_size,
-                    self.neox_args.max_position_embeddings,
-                    self.neox_args.hidden_dropout,
-                    self.init_method,
-                    self.num_tokentypes,
-                    forward_fn=_logits_helper,
-                    tied_weight_attr="word_embeddings_weight",
-                )
-            )
-        else:
-            self.specs.append(
-                LayerSpec(
-                    ParallelLinearPipe,
-                    neox_args=self.neox_args,
-                    init_method=self.init_method,
-                    parallel_output=self.parallel_output,
-                    is_last_layer=True,
-                )
-            )
+        )
 
     def _set_parallel_output(self, value):
         # sets the parallel output value of the final layer to value
@@ -352,8 +318,6 @@ class GPT2ModelPipe(PipelineModule, torch.nn.Module):
         """
         Sets up the model for inference by turning on k/v caching (if specified) and setting `parallel output` of the final layer to false,
         so logits are gathered across model parallel ranks.
-
-        :param cache: (bool) True if you want to use caching during inference, False otherwise
         """
         # first set caching to true if specified
         recursive_setattr(self.forward_funcs, "use_cache", use_cache, assert_type=bool)

@@ -88,6 +88,10 @@ def get_ltor_masks_and_position_ids(
 ):
     """Build masks and position id for left to right model."""
 
+    if data.ndimension() == 1:
+        # If data is 1D, reshape it into [batch_size, seq_length]
+        data = data.view(1, 2048)
+
     # Extract batch size and sequence length.
     batch_size, seq_length = data.size()
 

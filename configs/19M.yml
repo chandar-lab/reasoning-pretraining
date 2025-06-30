@@ -1,5 +1,5 @@
 {
-  "pipe_parallel_size": 1,
+  "pipe_parallel_size": 0,
   "model_parallel_size": 1,
 
   # model settings
@@ -43,10 +43,21 @@
     "contiguous_gradients": True,
   },
 
-  "train_micro_batch_size_per_gpu": 4, #32,
+  "train_micro_batch_size_per_gpu": 6, #32,
   "gradient_accumulation_steps": 1,
   "data_impl": "mmap",
   "num_workers": 1,
+  # train_impl: "latent_rl",
+  latent_thinking_steps: 4,
+
+  "vocab-file": "/lustre/orion/bif151/proj-shared/Meta-Llama-3-8B/tokenizer.json",
+  "tokenizer_type": "Llama3HFTokenizer",
+  "data_path": "/lustre/orion/bif151/proj-shared/data_shared/llama3_tokenized_datasets/dclm-baseline/train_400B/dclm-baseline/merged_train",
+  # "test_data_paths": [
+  #   "/lustre/orion/bif151/proj-shared/data_shared/llama3_tokenized_datasets/dclm-baseline/test_400B/dclm-baseline/merged_test"],
+
+  # "valid_data_paths": [
+  #   "/lustre/orion/bif151/proj-shared/data_shared/llama3_tokenized_datasets/dclm-baseline/val/dclm-baseline/merged_val"],
 
   # activation checkpointing
   "checkpoint_activations": true,
@@ -70,7 +81,7 @@
     "hysteresis": 2,
     "min_loss_scale": 1,
   },
-
+  "use_wandb":false,
   "train_iters": 143000,
   "lr_decay_iters": 143000,
   "distributed_backend": "nccl",

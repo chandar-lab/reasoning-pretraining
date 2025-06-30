@@ -55,7 +55,8 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         # Get predicted-logits = logits[target].
         # For Simplicity, we convert logits to a 2-D tensor with size
         # [*, partition-vocab-size] and target to a 1-D tensor of size [*].
-        logits_2d = vocab_parallel_logits.view(-1, partition_vocab_size)
+        logits_2d = vocab_parallel_logits.contiguous().view(-1, partition_vocab_size)
+
         masked_target_1d = masked_target.view(-1)
         arange_1d = torch.arange(
             start=0, end=logits_2d.size()[0], device=logits_2d.device
